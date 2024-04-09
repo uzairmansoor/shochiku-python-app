@@ -1,0 +1,268 @@
+import mimetypes
+from tempfile import NamedTemporaryFile
+
+import boto3
+import torch
+import numpy as np
+import random
+import os
+from app import app
+from diffusers import LCMScheduler, AutoPipelineForText2Image, UNet2DConditionModel, AutoPipelineForImage2Image
+from flask import jsonify
+from PIL import Image
+from os import path
+from utils.common import save_image
+
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=app.config['AWS_ACCESS_KEY_ID'],
+    aws_secret_access_key=app.config['AWS_SECRET_ACCESS_KEY'],
+)
+
+
+class Hugging:
+    def __init__(
+            self,
+            model_id="lykon/dreamshaper-7",
+            adapter_id="latent-consistency/lcm-lora-sdv1-5",
+            safetensors_files_dir=app.config['SAFETENSORS_FILES_DIR']  # this should not be in the project folder/Github
+
+    ):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.adapter_weight = 1.0
+        self.model_id = model_id
+        self.adapter_id = adapter_id
+        self.safetensors_path = safetensors_files_dir+"/hearts_v1.safetensors"
+        self.safetensors_files_dir = safetensors_files_dir
+        self.pipe = None
+
+    def load_model(self):
+        #  model loading seperated so it is only one time loaded
+        self.scheduler = LCMScheduler.from_pretrained("scheduler_config.json")
+        if self.pipe is None:
+            unet = UNet2DConditionModel.from_pretrained(
+                "SimianLuo/LCM_Dreamshaper_v7",
+                subfolder="unet",
+                torch_dtype=torch.float16,
+                cache_dir=app.config['PRETRAINED_MODEL_CACHE_DIR'],
+                resume_download=True
+            ).to('cuda')
+            self.pipe = AutoPipelineForText2Image.from_pretrained(
+                self.model_id,
+                cache_dir=app.config['PRETRAINED_MODEL_CACHE_DIR'],
+                unet=unet,
+                torch_dtype=torch.float16,
+                variant="fp16",
+                resume_download=True,
+                scheduler=self.scheduler
+            ).to('cuda')
+            # print(self.pipe.scheduler.config)
+            # self.pipe.scheduler = LCMScheduler.from_config(self.pipe.scheduler.config)
+
+    def run_lora(self,loramodel):
+        print("===== Used loramodel ==== "+ loramodel)
+        if loramodel.lower() == "koiwazurai":
+            safetensors_path = self.safetensors_files_dir+"/hearts_v1.safetensors"
+        elif loramodel.lower() == "comedy":
+            safetensors_path = self.safetensors_files_dir+"/sdxl-dreambooth-comedy-movies-lora.safetensors"
+        elif loramodel.lower() == "horror":
+            safetensors_path = self.safetensors_files_dir+"/sdxl-dreambooth-horror-movies-lora.safetensors"
+        elif loramodel.lower() == "human drama":
+            safetensors_path = self.safetensors_files_dir+"/sdxl-dreambooth-drama-movies-lora.safetensors"
+        elif loramodel.lower() == "romance":
+            safetensors_path = self.safetensors_files_dir+"/sdxl-dreambooth-love-movies-lora.safetensors"
+        else:
+            safetensors_path = self.safetensors_files_dir+"/action-000001.safetensors"
+
+        print("===== Used safetensors file ==== "+ safetensors_path)
+        if loramodel.lower() not in self.pipe.get_active_adapters():
+            try:
+                self.pipe.load_lora_weights(safetensors_path, adapter_name=loramodel.lower())
+                self.pipe.set_adapters(loramodel.lower(), adapter_weights=self.adapter_weight)
+            except Exception as excp:
+                print("Adapter already set")
+
+
+
+    def text_to_image(self, prompt, temp_file_path, loramodel, seed=42 , width=512, height=512):
+        self.pipe = AutoPipelineForText2Image.from_pipe(self.pipe)
+        self.run_lora(loramodel)
+        # 画像の生成
+        seed = random.randint(0, os.sys.maxsize)+ np.random.randint(100000000)
+        generator = torch.Generator(device=self.device).manual_seed(int(seed))
+        image = self.pipe(
+            prompt=prompt, width=width, height=height, num_inference_steps=4, guidance_scale=0, generator=generator
+        ).images[0]
+        self.pipe.delete_adapters(adapter_names=loramodel.lower())
+        image = np.array(image)
+        image = Image.fromarray(image).resize((width, height))
+        save_image(image, temp_file_path)
+
+    def image_to_image(self, prompt, temp_file_path,loramodel, image, seed=42, strength=0.8):
+        self.pipe = AutoPipelineForImage2Image.from_pipe(self.pipe)
+        self.run_lora(loramodel)
+        #seed = 42
+        #seed = np.random.randint(10000)
+        print("seed: ", seed)
+        generator = torch.Generator(device=self.device).manual_seed(int(seed))
+        print('AR: ', image.size)
+        print("strength: ", strength)
+        print('model: ', loramodel)
+        print("Image Shape before Pipeline:", image.size)
+        try:
+            image = self.pipe(
+            prompt=prompt, image=image, strength=strength, num_inference_steps=2, guidance_scale=0, generator=generator
+        ).images[0]
+        except Exception as e:
+            print("error in generating image:", e)
+        print("Image Shape after Pipeline:", image.size)
+        self.pipe.delete_adapters(adapter_names=loramodel.lower())
+        save_image(image, temp_file_path)
+
+
+
+hugging = Hugging()
+
+def get_image_from_text(event):
+    data = event['body']
+    prompt = data['prompt']
+    num_images = data['num_images']
+    img_name = data['img_name']
+    img_id = data['id']
+    width = data['width']
+    height = data['height']
+    seed = data['seed']
+    basemodel = data['basemodel']
+    loramodel = data['loramodel']
+
+    urls = []
+
+    hugging.load_model()
+
+    for i in range(num_images):
+        seed = random.randint(0, os.sys.maxsize)+ np.random.randint(100000000)
+
+        with NamedTemporaryFile(suffix='.png') as temp_file:
+            hugging.text_to_image(prompt, temp_file.name, loramodel, seed, width, height)
+            mime_type, _ = mimetypes.guess_type(temp_file.name)
+            s3_file_path = f'{img_id}-{img_name}-{i}.png'
+            s3_client.upload_fileobj(
+                temp_file, app.config['S3_BUCKET_NAME'], s3_file_path,
+                ExtraArgs={
+                    'ContentType': mime_type
+                }
+            )
+
+        url = s3_client.generate_presigned_url(
+            'get_object', Params={'Bucket': app.config['S3_BUCKET_NAME'], 'Key': s3_file_path}
+        )
+        urls.append(url)
+
+    res = {
+        "statusCode": 200,
+        "headers": {},
+        "body": {
+            "urls": urls
+        }
+    }
+    return jsonify(res)
+
+
+def get_image_from_image1(event):
+    data = event['body']
+    prompt = data['prompt']
+    img_name = data['img_name']
+    img_id = data['id']
+    seed = data['seed']
+    strength = data['strength']
+    loramodel = data['loramodel']
+    num_images = data['image_num']
+    print("NUM of images: ", event)
+    hugging.load_model()
+    urls = []
+    
+    with NamedTemporaryFile(suffix='.png') as temp_file:
+        with NamedTemporaryFile(suffix='.png') as temp_input_file:
+            s3_client.download_fileobj(
+                app.config['S3_BUCKET_NAME'], data['input_img_name'], temp_input_file
+            )
+            print("Download successful: ", path.exists(temp_input_file.name))  # Check if file exists after download
+            input_image = Image.open(temp_input_file)
+            print("Input Image: ", input_image, "Path: ", temp_input_file)
+            print("Image size:", input_image.size) 
+            print("Image size:", input_image.format) 
+            hugging.image_to_image(prompt, temp_file.name,loramodel, input_image)
+
+        mime_type, _ = mimetypes.guess_type(temp_file.name)
+        s3_file_path = f'{img_id}-{img_name}.png'
+        s3_client.upload_fileobj(
+            temp_file, app.config['S3_BUCKET_NAME'], s3_file_path,
+            ExtraArgs={
+                'ContentType': mime_type
+            }
+        )
+
+    url = s3_client.generate_presigned_url(
+        'get_object', Params={'Bucket': app.config['S3_BUCKET_NAME'], 'Key': s3_file_path}
+    )
+    urls.append(url)
+
+    res = {
+        "statusCode": 200,
+        "headers": {},
+        "body": {
+            "url": urls
+        }
+    }
+    return jsonify(res)
+
+
+def get_image_from_image(event):
+    data = event['body']
+    prompt = data['prompt']
+    img_name = data['img_name']
+    img_id = data['id']
+    seed = data['seed']
+    strength = data['strength']
+    loramodel = data['loramodel']
+    num_images = data['image_num']
+    print("NUM of images: ", event)
+    hugging.load_model()
+    urls = []
+    
+    for i in range(num_images):
+        seed = random.randint(0, os.sys.maxsize)+ np.random.randint(100000000)
+        with NamedTemporaryFile(suffix='.png') as temp_file:
+            with NamedTemporaryFile(suffix='.png') as temp_input_file:
+                s3_client.download_fileobj(
+                    app.config['S3_BUCKET_NAME'], data['input_img_name'], temp_input_file
+                )
+                print("Download successful: ", path.exists(temp_input_file.name))  # Check if file exists after download
+                input_image = Image.open(temp_input_file)
+                print("Input Image: ", input_image, "Path: ", temp_input_file)
+                print("Image size:", input_image.size) 
+                print("Image size:", input_image.format) 
+                hugging.image_to_image(prompt, temp_file.name,loramodel, input_image, seed)
+
+            mime_type, _ = mimetypes.guess_type(temp_file.name)
+            s3_file_path = f'{img_id}-{img_name}-{i}.png'
+            s3_client.upload_fileobj(
+                temp_file, app.config['S3_BUCKET_NAME'], s3_file_path,
+                ExtraArgs={
+                    'ContentType': mime_type
+                }
+            )
+
+        url = s3_client.generate_presigned_url(
+            'get_object', Params={'Bucket': app.config['S3_BUCKET_NAME'], 'Key': s3_file_path}
+        )
+        urls.append(url)
+
+    res = {
+        "statusCode": 200,
+        "headers": {},
+        "body": {
+            "url": urls
+        }
+    }
+    return jsonify(res)
