@@ -1,0 +1,13 @@
+flask==3.0.0
+openai==0.27.8
+langchain==0.0.271
+# EC2 instance has pytorch pre-configured
+# -f https://download.pytorch.org/whl/torch_stable.html
+# torch==2.0.0+cu118
+boto3==1.29.0
+watchtower==3.0.1
+transformers==4.35.2
+diffusers==0.24.0
+accelerate
+python-dotenv
+gunicorn
